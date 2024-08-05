@@ -38,15 +38,37 @@
           </div>
         </div>
       </n-tab-pane>
+      <n-tab-pane name="batchRecognition" tab="非实时识别">
+        <button @click="startBatchRecognition" :disabled="isBatchRecognizing">
+          开始录音
+        </button>
+        <button @click="stopBatchRecognition" :disabled="!isBatchRecognizing">
+          停止录音并识别
+        </button>
+        <div v-if="audioUrl">
+          <h3>录音播放：</h3>
+          <audio controls :src="audioUrl"></audio>
+        </div>
+        <p>识别结果: {{ batchRecognitionResult }}</p>
+        <div v-if="batchRecognitionDetails">
+          <h3>详细识别信息：</h3>
+          <pre>{{ JSON.stringify(batchRecognitionDetails, null, 2) }}</pre>
+        </div>
+      </n-tab-pane>
     </n-tabs>
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref } from "vue";
-import { getMicrophoneList, sttFromMicStream } from "@/speech-recognition";
+import { onMounted, onUnmounted, ref } from "vue";
+import {
+  getMicrophoneList,
+  sttFromMicStream,
+  sttFromAudioFile,
+} from "@/speech-recognition";
 import { NTabs, NTabPane, NSelect } from "naive-ui";
 import * as sdk from "microsoft-cognitiveservices-speech-sdk";
+import { createFFmpeg, fetchFile } from "@ffmpeg/ffmpeg";
 
 const isRecognizing = ref(false);
 const isRecognizingMic = ref(false);
@@ -58,6 +80,23 @@ const micList = ref([]);
 const selectedMic = ref(null);
 let stopRecognitionFunc = null;
 let stopRecognitionMicFunc = null;
+
+const isBatchRecognizing = ref(false);
+const batchRecognitionResult = ref("");
+const batchRecognitionDetails = ref(null);
+let mediaRecorder = null;
+let audioChunks = [];
+const audioUrl = ref(null);
+
+const ffmpeg = ref(null);
+const fetchFileFunc = ref(null);
+
+onMounted(async () => {
+  const { FFmpeg } = await import("@ffmpeg/ffmpeg");
+  const { fetchFile } = await import("@ffmpeg/util");
+  ffmpeg.value = new FFmpeg();
+  fetchFileFunc.value = fetchFile;
+});
 
 const startRecognition = () => {
   isRecognizing.value = true;
@@ -142,6 +181,69 @@ const stopRecognitionMic = () => {
   }
 };
 
+const startBatchRecognition = () => {
+  isBatchRecognizing.value = true;
+  batchRecognitionResult.value = "";
+  batchRecognitionDetails.value = null;
+  audioChunks = [];
+  audioUrl.value = null;
+
+  navigator.mediaDevices
+    .getUserMedia({ audio: true })
+    .then((stream) => {
+      mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      mediaRecorder.ondataavailable = (event) => {
+        audioChunks.push(event.data);
+      };
+      mediaRecorder.start();
+    })
+    .catch((error) => {
+      console.error("获取麦克风权限失败:", error);
+      isBatchRecognizing.value = false;
+    });
+};
+
+const stopBatchRecognition = async () => {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+    mediaRecorder.onstop = async () => {
+      const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+      audioUrl.value = URL.createObjectURL(audioBlob);
+
+      try {
+        if (!ffmpeg.value || !fetchFileFunc.value) {
+          const { FFmpeg } = await import("@ffmpeg/ffmpeg");
+          const { fetchFile } = await import("@ffmpeg/util");
+          ffmpeg.value = new FFmpeg();
+          fetchFileFunc.value = fetchFile;
+        }
+        await ffmpeg.value.load();
+        ffmpeg.value.FS("writeFile", "input.webm", await fetchFile(audioBlob));
+        await ffmpeg.value.run("-i", "input.webm", "output.wav");
+        const data = ffmpeg.value.FS("readFile", "output.wav");
+        const wavFile = new File([data.buffer], "speech.wav", {
+          type: "audio/wav",
+        });
+
+        sttFromAudioFile(wavFile, {
+          onResult: (result, details) => {
+            batchRecognitionResult.value = result;
+            batchRecognitionDetails.value = details;
+            isBatchRecognizing.value = false;
+          },
+          onError: (error) => {
+            console.error("批处理识别错误:", error);
+            isBatchRecognizing.value = false;
+          },
+        });
+      } catch (error) {
+        console.error("音频转换错误:", error);
+        isBatchRecognizing.value = false;
+      }
+    };
+  }
+};
+
 const getMicList = async () => {
   try {
     const microphones = await getMicrophoneList();
@@ -160,5 +262,11 @@ const getMicList = async () => {
 
 onMounted(() => {
   getMicList();
+});
+
+onUnmounted(() => {
+  if (audioUrl.value) {
+    URL.revokeObjectURL(audioUrl.value);
+  }
 });
 </script>
